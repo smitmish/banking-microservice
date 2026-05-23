@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # 1. Zookeeper: Manages state and consensus for Apache Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: banking-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # 2. Apache Kafka: The backbone asynchronous event router
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: banking-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # 3. Kafka UI: A clean web browser interface to watch messages stream in real-time
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: banking-kafka-ui
+    ports:
+      - "8090:8080" # Maps to localhost:8090 so it doesn't conflict with Spring Boot port 8080
+    depends_on:
+      - kafka
+    environment:
+      DYNAMIC_CONFIG_ENABLED: 'true'
+      KAFKA_CLUSTERS_0_NAME: local-banking-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # 4. PostgreSQL Container (Optional backend for your decoupled Transaction Service)
+  transaction-db:
+    image: postgres:15-alpine
+    container_name: transaction-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: bank_transactions
+      POSTGRES_USER: tx_user
+      POSTGRES_PASSWORD: tx_password
