@@ -4,12 +4,15 @@ import com.banking.account.dto.AccountDto;
 import com.banking.account.dto.TransactionEventDto;
 import com.banking.account.dto.TransferFundDto;
 import com.banking.account.entity.Account;
+import com.banking.account.entity.OutboxMessage;
 import com.banking.account.exception.AccountException;
 import com.banking.account.mapper.AccountMapper;
 import com.banking.account.repository.AccountRepository;
+import com.banking.account.repository.OutboxRepository;
 import com.banking.account.service.AccountService;
-import org.springframework.kafka.core.KafkaTemplate;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -19,12 +22,16 @@ import java.util.stream.Collectors;
 public class AccountServiceImpl implements AccountService {
 
     private final AccountRepository accountRepository;
-    private final KafkaTemplate<String, TransactionEventDto> kafkaTemplate;
+    private final OutboxRepository outboxRepository;
+    private final ObjectMapper objectMapper; // For converting DTOs to JSON strings
     private static final String TOPIC = "banking-transactions";
 
-    public AccountServiceImpl(AccountRepository accountRepository, KafkaTemplate<String, TransactionEventDto> kafkaTemplate) {
+    public AccountServiceImpl(AccountRepository accountRepository,
+                              OutboxRepository outboxRepository,
+                              ObjectMapper objectMapper) {
         this.accountRepository = accountRepository;
-        this.kafkaTemplate = kafkaTemplate;
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -43,25 +50,33 @@ public class AccountServiceImpl implements AccountService {
 
     @Override
     public AccountDto deposit(Long id, double amount) {
+        //1.fetch the entity from database.
         Account account = accountRepository.findById(id)
                 .orElseThrow(() -> new AccountException("Account does not exist: " + id));
-
+        //invoke the encapsulated business rule method.
+        account.deposit(amount);
+        //Save the updated valid state back to your database.
         account.setBalance(account.getBalance() + amount);
-        Account savedAccount = accountRepository.save(account);
+        //Account savedAccount = accountRepository.save(account);
 
-        // Prepare the event
-        TransactionEventDto event = new TransactionEventDto(id, amount, "DEPOSIT", LocalDateTime.now());
-        // Asynchronously dispatch to Kafka
-        kafkaTemplate.send(TOPIC, event).whenComplete((result, exception) -> {
-            if (exception != null) {
-                System.err.printf("ALERT: Ledger log failed for Account %d. Error: %s%n", id, exception.getMessage());
-            } else {
-                System.out.printf("Ledger logged successfully to partition %d%n", result.getRecordMetadata().partition());
-            }
-        });
-        // Return success to the customer instantly
+        // 2. Stage the event messages directly into the outbox entity instead of calling Kafka
+        try {
+            // Prepare the event
+            TransactionEventDto event = new TransactionEventDto(id, amount, "DEBIT",
+                    LocalDateTime.now());
 
-        return AccountMapper.maptoAccountDto(savedAccount);
+            // Convert payloads to JSON strings
+            String creditJson = objectMapper.writeValueAsString(event);
+
+            // Save records directly into the same transaction boundary
+            outboxRepository.save(new OutboxMessage(TOPIC, creditJson));
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize outbox transaction payloads", e);
+        }
+
+
+        return AccountMapper.maptoAccountDto(account);
     }
 
     @Override
@@ -73,22 +88,29 @@ public class AccountServiceImpl implements AccountService {
             throw new AccountException("Insufficient amount.");
         }
 
+        // 1. Mutate balances locally inside Oracle
         account.setBalance(account.getBalance() - amount);
-        Account savedAccount = accountRepository.save(account);
+        //Handle by Spring JPA transactional process as any changes made by
+        //setters was saved so commenting below line.
+        //Account savedAccount = accountRepository.save(account);
 
-        // Prepare the event
-        TransactionEventDto event = new TransactionEventDto(id, amount, "WITHDRAW", LocalDateTime.now());
-        // Asynchronously dispatch to Kafka
-        kafkaTemplate.send(TOPIC, event).whenComplete((result, exception) -> {
-            if (exception != null) {
-                System.err.printf("ALERT: Ledger log failed for Account %d. Error: %s%n", id, exception.getMessage());
-            } else {
-                System.out.printf("Ledger logged successfully to partition %d%n", result.getRecordMetadata().partition());
-            }
-        });
-        // Return success to the customer instantly
+        // 2. Stage the event messages directly into the outbox entity instead of calling Kafka
+        try {
+            // Prepare the event
+            TransactionEventDto event = new TransactionEventDto(id, amount, "DEBIT",
+                    LocalDateTime.now());
 
-        return AccountMapper.maptoAccountDto(savedAccount);
+            // Convert payloads to JSON strings
+            String debitJson = objectMapper.writeValueAsString(event);
+
+            // Save records directly into the same transaction boundary
+            outboxRepository.save(new OutboxMessage(TOPIC, debitJson));
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize outbox transaction payloads", e);
+        }
+
+        return AccountMapper.maptoAccountDto(account);
     }
 
     @Override
@@ -106,42 +128,50 @@ public class AccountServiceImpl implements AccountService {
     }
 
     @Override
+    @Transactional // Ensures atomicity over BOTH accounts and the outbox write
     public void transferFunds(TransferFundDto transferFundDto) {
         Account debitAccount = accountRepository.findById(transferFundDto.debitAccountId())
-                .orElseThrow(() -> new AccountException("Debit account does not exist: " + transferFundDto.debitAccountId()));
+                .orElseThrow(() -> new AccountException("Debit account not found: " + transferFundDto.debitAccountId()));
 
         Account creditAccount = accountRepository.findById(transferFundDto.creditAccountId())
-                .orElseThrow(() -> new AccountException("Credit account does not exist: " + transferFundDto.creditAccountId()));
+                .orElseThrow(() -> new AccountException("Credit account not found: " + transferFundDto.creditAccountId()));
 
         if (debitAccount.getBalance() < transferFundDto.amount()) {
-            throw new AccountException("Insufficient amount.");
+            throw new AccountException("Insufficient Balance in Debit Account.");
         }
 
+        // 1. Mutate balances locally inside Oracle
         debitAccount.setBalance(debitAccount.getBalance() - transferFundDto.amount());
         creditAccount.setBalance(creditAccount.getBalance() + transferFundDto.amount());
+//        In Spring Data JPA, because your entities are
+//        managed within a transaction, any changes you
+//        make via setters are automatically written to
+//        the database when the method ends. Calling
+//                .save(debitAccount) explicitly is redundant
+//        here and can sometimes confuse Hibernate's execution plan,
+//        causing it to prematurely check the database state with a
+//        SELECT query to decide whether it should perform an INSERT or an UPDATE.
+//        accountRepository.save(debitAccount);
+//        accountRepository.save(creditAccount);
 
-        accountRepository.save(debitAccount);
-        accountRepository.save(creditAccount);
+        // 2. Stage the event messages directly into the outbox entity instead of calling Kafka
+        try {
+            // Prepare the event
+            TransactionEventDto debitEvent = new TransactionEventDto(
+                    transferFundDto.debitAccountId(), transferFundDto.amount(), "DEBIT", LocalDateTime.now());
+            TransactionEventDto creditEvent = new TransactionEventDto(
+                    transferFundDto.creditAccountId(), transferFundDto.amount(), "CREDIT", LocalDateTime.now());
 
-       // Prepare the event
-        TransactionEventDto inEvent = new TransactionEventDto(transferFundDto.debitAccountId(),
-                transferFundDto.amount(), "TRANSFER_OUT", LocalDateTime.now());
-        TransactionEventDto outEvent = new TransactionEventDto(transferFundDto.creditAccountId(),
-                transferFundDto.amount(), "TRANSFER_IN", LocalDateTime.now());
-        // Asynchronously dispatch to Kafka
-        kafkaTemplate.send(TOPIC, inEvent).whenComplete((result, exception) -> {
-            if (exception != null) {
-                System.err.printf("ALERT: Ledger log failed for Account %d. Error: %s%n", transferFundDto.debitAccountId(), exception.getMessage());
-            } else {
-                System.out.printf("Ledger logged successfully to partition %d%n", result.getRecordMetadata().partition());
-            }
-        });
-        kafkaTemplate.send(TOPIC, outEvent).whenComplete((result, exception) -> {
-            if (exception != null) {
-                System.err.printf("ALERT: Ledger log failed for Account %d. Error: %s%n", transferFundDto.debitAccountId(), exception.getMessage());
-            } else {
-                System.out.printf("Ledger logged successfully to partition %d%n", result.getRecordMetadata().partition());
-            }
-        });
+            // Convert payloads to JSON strings
+            String debitJson = objectMapper.writeValueAsString(debitEvent);
+            String creditJson = objectMapper.writeValueAsString(creditEvent);
+
+            // Save records directly into the same transaction boundary
+            outboxRepository.save(new OutboxMessage(TOPIC, debitJson));
+            outboxRepository.save(new OutboxMessage(TOPIC, creditJson));
+
+        } catch (Exception e) {
+            throw new AccountException("Failed to serialize outbox transaction payloads" + e);
+        }
     }
 }
