@@ -8,9 +8,15 @@ import lombok.*;
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
-@Table(name = "accounts")
+
 @Entity
-public class Account {
+@Table(name = "accounts")
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@DiscriminatorColumn(name = "account_type", discriminatorType = DiscriminatorType.STRING)
+
+//Upgrade: Marked as sealed and restricted to our exact domain subclasses
+public abstract sealed class Account permits SavingsAccount, BusinessAccount {
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
@@ -18,16 +24,22 @@ public class Account {
     @Column(name = "account_holder_name")
     private String accountHolderName;
 
-    private double balance;
+    protected double balance;
 
-    // The only way to change the balance is through strict business validation rules
+    // Getters, setters, and deposit() remain identical...
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public String getAccountHolderName() { return accountHolderName; }
+    public void setAccountHolderName(String accountHolderName) { this.accountHolderName = accountHolderName; }
+    public double getBalance() { return balance; }
+
     public void deposit(double amount) {
         if (amount > 0) {
             this.balance += amount;
         } else {
-            throw new AccountException("Deposit amount must be positive");
+            throw new IllegalArgumentException("Deposit amount must be positive");
         }
     }
 
-
+    public abstract void verifyWithdrawalLimit(double amount) throws AccountException;
 }

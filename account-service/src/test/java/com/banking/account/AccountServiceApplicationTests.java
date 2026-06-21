@@ -2,6 +2,7 @@ package com.banking.account;
 
 import com.banking.account.dto.TransferFundDto;
 import com.banking.account.entity.Account;
+import com.banking.account.entity.SavingsAccount;
 import com.banking.account.exception.AccountException;
 import com.banking.account.repository.AccountRepository;
 import com.banking.account.repository.OutboxRepository;
@@ -40,12 +41,12 @@ class AccountServiceApplicationTests {
 	@BeforeEach
 	void setUp() {
 		// Prepare clean in-memory account objects before each test runs
-		sourceAccount = new Account();
+		sourceAccount = new SavingsAccount();
 		sourceAccount.setId(12345L);
 		sourceAccount.setAccountHolderName("Smit");
 		sourceAccount.deposit(1000.0); // Encapsulated baseline balance
 
-		targetAccount = new Account();
+		targetAccount = new SavingsAccount();
 		targetAccount.setId(67890L);
 		targetAccount.setAccountHolderName("Ranu");
 		targetAccount.deposit(500.0);
